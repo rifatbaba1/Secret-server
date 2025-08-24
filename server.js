@@ -1,153 +1,97 @@
 // server.js
-const express = require('express');
-const http = require('http');
-const cors = require('cors');
-const { Server } = require('socket.io');
-
-const PORT = process.env.PORT || 10000;
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
 
 const app = express();
-app.use(cors({ origin: '*'}));
-
-app.get('/', (_, res) => res.status(200).send('OK'));
-app.get('/healthz', (_, res) => res.status(200).json({ ok: true }));
-
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*'},
-  transports: ['websocket', 'polling']
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-/** Kuyruklar (modlara göre) */
-const queues = {
-  face: [],
-  voice: [],
-  chat:  []
-};
+// ---- Basit durumlar
+app.get("/", (_, res) => res.send("ok"));
+app.get("/status", (_, res) => {
+  res.json({
+    waiting: waiting.face.map(s => s.id),
+    pairs: [...pairs.entries()].map(([a,b]) => [a,b])
+  });
+});
 
-/** socket.id -> room, mode eşlemesi */
-const socketRoom = new Map();   // socketId -> room
-const socketMode = new Map();   // socketId -> mode
+// ---- Eşleştirme durumu
+const waiting = { face: [] };      // sıradaki kullanıcılar
+const pairs   = new Map();          // socketId -> peerSocketId
 
-/** Kuyruktan soketi sil (disconnect/cancel için) */
-function removeFromQueues(id){
-  for (const key of Object.keys(queues)) {
-    const i = queues[key].indexOf(id);
-    if (i !== -1) queues[key].splice(i,1);
+function removeFromWaiting(sock) {
+  waiting.face = waiting.face.filter(s => s.id !== sock.id);
+}
+
+function unpair(sock, informPeer = true) {
+  const peerId = pairs.get(sock.id);
+  if (peerId) {
+    pairs.delete(sock.id);
+    pairs.delete(peerId);
+    if (informPeer) {
+      const peer = io.sockets.sockets.get(peerId);
+      peer?.emit("peer-left");
+      removeFromWaiting(peer); // emniyet
+    }
   }
 }
 
-/** Eşleştir ve odaya al */
-function pairSockets(mode, aId, bId){
-  const room = `room_${mode}_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
-  const a = io.sockets.sockets.get(aId);
-  const b = io.sockets.sockets.get(bId);
-  if (!a || !b) return;
+io.on("connection", (socket) => {
+  console.log("connected", socket.id);
 
-  a.join(room);
-  b.join(room);
+  // İstemci “face” için arama ister
+  socket.on("find", (mode = "face") => {
+    // önce eski durumları temizle
+    unpair(socket, false);
+    removeFromWaiting(socket);
 
-  socketRoom.set(aId, room);
-  socketRoom.set(bId, room);
-  socketMode.set(aId, mode);
-  socketMode.set(bId, mode);
+    // sırada biri var mı? (kendimiz değil)
+    const other = waiting.face.find(s => s.id !== socket.id);
+    if (other) {
+      // kuyuktan çıkar ve eşleştir
+      waiting.face = waiting.face.filter(s => s.id !== other.id);
 
-  // İki tarafa da eşleşti bilgisi
-  a.emit('matched', { room, mode, peerId: bId });
-  b.emit('matched', { room, mode, peerId: aId });
-}
+      const room = `room_face_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+      console.log("match!", room, socket.id, other.id);
 
-io.on('connection', (socket) => {
-  console.log('socket connected', socket.id);
+      pairs.set(socket.id,  other.id);
+      pairs.set(other.id,   socket.id);
 
-  /** Yeni kişi bul (mode: face|voice|chat) */
-  socket.on('find', (mode = 'face') => {
-    if (!['face','voice','chat'].includes(mode)) mode = 'face';
+      socket.join(room);
+      other.join(room);
 
-    // Önce kuyrukta birini var mı bak
-    const q = queues[mode];
-    let peerId = null;
-
-    // Kendini kuyruktan temizle (double click vs.)
-    removeFromQueues(socket.id);
-
-    // Boşta bekleyen varsa eşleştir
-    while (q.length && !peerId) {
-      const candidate = q.shift();
-      if (io.sockets.sockets.get(candidate)) peerId = candidate;
-    }
-
-    if (peerId) {
-      pairSockets(mode, socket.id, peerId);
+      socket.emit("matched", { room, mode: "face", peerId: other.id });
+      other.emit ("matched", { room, mode: "face", peerId: socket.id });
     } else {
-      // beklemeye al
-      q.push(socket.id);
-      socket.emit('waiting', { mode });
+      // sıraya al
+      waiting.face.push(socket);
+      socket.emit("waiting", { mode: "face" });
+      console.log("waiting", socket.id);
     }
   });
 
-  /** Aramayı iptal et (kuyruktan çık) */
-  socket.on('cancelFind', () => {
-    removeFromQueues(socket.id);
-    socket.emit('waitingCanceled');
+  // WebRTC sinyalleşme
+  socket.on("signal", (payload) => {
+    const peerId = pairs.get(socket.id);
+    if (!peerId) return;
+    io.to(peerId).emit("signal", payload);
   });
 
-  /** Karşı tarafa sinyal geç (tek event) */
-  socket.on('signal', (data = {}) => {
-    const room = data.room || socketRoom.get(socket.id);
-    if (!room) return;
-    socket.to(room).emit('signal', data);
+  // manuel sonlandırma / tekrar arama öncesi
+  socket.on("hangup", () => {
+    removeFromWaiting(socket);
+    unpair(socket);
   });
 
-  /** Alternatif: ayrı offer/answer/ice isimleri kullanıyorsan hepsini relay et */
-  ['webrtc-offer','webrtc-answer','webrtc-ice'].forEach(evt => {
-    socket.on(evt, (payload = {}) => {
-      const room = payload.room || socketRoom.get(socket.id);
-      if (!room) return;
-      io.to(room).emit(evt, { from: socket.id, ...payload });
-      // ya da socket.to(room).emit(...) dersen kendine dönmez
-      // çoğu istemci için kendine dönmesine gerek yok:
-      // socket.to(room).emit(evt, { from: socket.id, ...payload });
-    });
-  });
-
-  /** Chat mesajını odaya ilet (metin sohbeti varsa) */
-  socket.on('chat', (payload = {}) => {
-    const room = payload.room || socketRoom.get(socket.id);
-    if (!room) return;
-    socket.to(room).emit('chat', { from: socket.id, text: payload.text || '' });
-  });
-
-  /** Bitir/Hangup: odayı ve eşleşmeyi kapat */
-  socket.on('hangup', () => {
-    const room = socketRoom.get(socket.id);
-    if (room) {
-      socket.to(room).emit('peer-left');
-      // odadaki herkesi çıkarmaya çalışma; bırak karşı taraf kalsın/temizlensin
-    }
-    cleanupSocket(socket);
-  });
-
-  /** Koparsa temizlik */
-  socket.on('disconnect', () => {
-    const room = socketRoom.get(socket.id);
-    if (room) socket.to(room).emit('peer-left');
-    cleanupSocket(socket);
-    console.log('socket disconnected', socket.id);
+  socket.on("disconnect", () => {
+    console.log("disconnected", socket.id);
+    removeFromWaiting(socket);
+    unpair(socket);
   });
 });
 
-/** Tüm izleri sil */
-function cleanupSocket(socket){
-  removeFromQueues(socket.id);
-  const room = socketRoom.get(socket.id);
-  if (room) {
-    try { socket.leave(room); } catch {}
-    socketRoom.delete(socket.id);
-  }
-  socketMode.delete(socket.id);
-}
-
-server.listen(PORT, () => {
-  console.log(`Server çalışıyor: ${PORT}`);
-});
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => console.log("Server çalışıyor:", PORT));
